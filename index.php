@@ -1,346 +1,328 @@
 <?php
-session_start();
+require __DIR__ . '/storage.php';
 
-// --- CONFIGURATION ---
-$possible_dirs = [
-    __DIR__ . '/data/',
-    __DIR__ . '/',
-    sys_get_temp_dir() . '/dashboard_data/',
-    '/tmp/dashboard_data/'
-];
-$data_dir = null;
-foreach ($possible_dirs as $dir) {
-    if (!is_dir($dir)) @mkdir($dir, 0755, true);
-    if (is_dir($dir) && is_writable($dir)) {
-        $data_dir = $dir;
-        break;
-    }
-}
-define('CONFIG_FILE', $data_dir . 'dashboard_config.json');
-define('USERS_FILE', $data_dir . 'users.json');
-define('ICONS_DIR', __DIR__ . '/icons/');
-if (!is_dir(ICONS_DIR)) @mkdir(ICONS_DIR, 0755, true);
+function isAuthenticated(): bool { return isset($_SESSION['user']); }
+function isAdmin(): bool { return isAuthenticated() && $_SESSION['role'] === 'admin'; }
 
-// --- INIT CONFIG ---
-function initializeConfig() {
-    $defaultConfig = [
-        'dashboard_title' => 'Dashboard',
-        'groups' => [
-            [
-                'id' => 1,
-                'name' => 'Data Management',
-                'color' => '#f5f5f7',
-                'services' => [
-                    [
-                        'id' => 1,
-                        'title' => 'Slack',
-                        'description' => 'Team communication',
-                        'url' => 'https://slack.com',
-                        'icon_type' => 'fa',
-                        'icon' => 'fa-brands fa-slack',
-                        'shared' => false,
-                        'allowed_users' => [],
-                        'note' => ''
-                    ],
-                    [
-                        'id' => 2,
-                        'title' => 'Asana',
-                        'description' => 'Task tracking',
-                        'url' => 'https://asana.com',
-                        'icon_type' => 'fa',
-                        'icon' => 'fa-brands fa-asana',
-                        'shared' => false,
-                        'allowed_users' => [],
-                        'note' => ''
-                    ]
-                ]
-            ]
-        ],
-        'next_group_id' => 2,
-        'next_service_id' => 3
-    ];
-    if (!file_exists(CONFIG_FILE)) {
-        file_put_contents(CONFIG_FILE, json_encode($defaultConfig, JSON_PRETTY_PRINT));
-    }
-    $defaultUsers = [
-        'admin' => [
-            'password' => password_hash('admin123', PASSWORD_DEFAULT),
-            'role' => 'admin'
-        ]
-    ];
-    if (!file_exists(USERS_FILE)) {
-        file_put_contents(USERS_FILE, json_encode($defaultUsers, JSON_PRETTY_PRINT));
-    }
-}
-function loadConfig() {
-    if (!file_exists(CONFIG_FILE)) initializeConfig();
-    return json_decode(file_get_contents(CONFIG_FILE), true);
-}
-function saveConfig($config) {
-    file_put_contents(CONFIG_FILE, json_encode($config, JSON_PRETTY_PRINT));
-}
-function loadUsers() {
-    if (!file_exists(USERS_FILE)) initializeConfig();
-    return json_decode(file_get_contents(USERS_FILE), true);
-}
-function saveUsers($users) {
-    file_put_contents(USERS_FILE, json_encode($users, JSON_PRETTY_PRINT));
-}
-function isAuthenticated() { return isset($_SESSION['user']); }
-function isAdmin() { return isset($_SESSION['user']) && $_SESSION['role'] === 'admin'; }
-
-// --- LOGIN/LOGOUT ---
-if (isset($_POST['login'])) {
-    $users = loadUsers();
-    $username = trim($_POST['username']);
-    $password = $_POST['password'];
-    if (isset($users[$username]) && password_verify($password, $users[$username]['password'])) {
-        $_SESSION['user'] = $username;
-        $_SESSION['role'] = $users[$username]['role'];
-        header('Location: ' . $_SERVER['PHP_SELF']); exit;
-    } else {
-        $loginError = 'Invalid credentials';
-    }
-}
-if (isset($_GET['logout'])) {
-    session_destroy();
-    header('Location: ' . $_SERVER['PHP_SELF']); exit;
+function canView(array $service): bool
+{
+    return isAdmin() || (isAuthenticated() && (
+        ($service['shared'] ?? false) === true
+        || in_array($_SESSION['user'], (array) ($service['allowed_users'] ?? []), true)
+    ));
 }
 
-// --- AJAX ACTIONS ---
-if (isset($_POST['action']) && isAuthenticated()) {
-    $config = loadConfig();
-    $users = loadUsers();
-    $response = ['success' => false];
-    switch ($_POST['action']) {
+function callJs(string $function, mixed ...$args): string
+{
+    $encoded = array_map(fn($arg) => json_encode($arg, JSON_THROW_ON_ERROR), $args);
+    return htmlspecialchars($function . '(' . implode(',', $encoded) . ')', ENT_QUOTES, 'UTF-8');
+}
+
+function serviceIconUrl(array $service): string
+{
+    $icon = $service['icon'] ?? '';
+    return match ($service['icon_type'] ?? '') {
+        'upload' => uploadedIcon($icon) ? '?icon=' . rawurlencode(basename($icon)) : '',
+        'url' => httpUrl($icon) ? $icon : '',
+        default => '',
+    };
+}
+
+function redirectHome(): never
+{
+    header('Location: ' . ($_SERVER['SCRIPT_NAME'] ?? '/index.php'), true, 303);
+    exit;
+}
+
+function jsonResponse(array $response, int $status = 200): never
+{
+    http_response_code($status);
+    header('Content-Type: application/json');
+    echo json_encode($response, JSON_THROW_ON_ERROR);
+    exit;
+}
+
+function handleAction(string $action, array $config, array $users): array
+{
+    if (!isAuthenticated()) {
+        jsonResponse(['success' => false, 'message' => 'Sign in first.'], 401);
+    }
+    if (!isAdmin() && !in_array($action, ['get_note', 'change_password'], true)) {
+        jsonResponse(['success' => false, 'message' => 'Access denied.'], 403);
+    }
+    $id = post('id');
+    $username = trim(post('username'));
+    switch ($action) {
         case 'add_group':
-            if (isAdmin()) {
-                $color = $_POST['color'] ?? '#f5f5f7';
-                $config['groups'][] = [
-                    'id' => $config['next_group_id'],
-                    'name' => $_POST['name'],
-                    'color' => $color,
-                    'services' => []
-                ];
-                $config['next_group_id']++;
-                saveConfig($config);
-                $response = ['success' => true];
-            }
-            break;
         case 'update_group':
-            if (isAdmin()) {
-                foreach ($config['groups'] as &$group) {
-                    if ($group['id'] == $_POST['id']) {
-                        $group['name'] = $_POST['name'];
-                        $group['color'] = $_POST['color'] ?? '#f5f5f7';
-                        break;
-                    }
+            $name = trim(post('name'));
+            if ($name === '') {
+                throw new InvalidArgumentException('Enter a group name.');
+            }
+            $color = groupColor(post('color'));
+            if ($action === 'add_group') {
+                $config['groups'][] = [
+                    'id' => $config['next_group_id']++, 'name' => $name,
+                    'color' => $color, 'services' => [],
+                ];
+                saveConfig($config);
+                break;
+            }
+            foreach ($config['groups'] as &$group) {
+                if ((string) $group['id'] === $id) {
+                    $group['name'] = $name;
+                    $group['color'] = $color;
+                    saveConfig($config);
+                    return ['success' => true];
                 }
-                saveConfig($config);
-                $response = ['success' => true];
             }
-            break;
+            throw new InvalidArgumentException('Group not found.');
         case 'delete_group':
-            if (isAdmin()) {
-                $config['groups'] = array_values(array_filter($config['groups'], fn($g) => $g['id'] != $_POST['id']));
-                saveConfig($config);
-                $response = ['success' => true];
+            $before = count($config['groups']);
+            $config['groups'] = array_values(array_filter($config['groups'], fn($group) => (string) $group['id'] !== $id));
+            if (count($config['groups']) === $before) {
+                throw new InvalidArgumentException('Group not found.');
             }
+            saveConfig($config);
             break;
         case 'add_service':
         case 'update_service':
-            if (isAdmin()) {
-                $icon_type = $_POST['icon_type'];
-                $icon = '';
-                if ($icon_type === 'fa') $icon = $_POST['icon_fa'];
-                elseif ($icon_type === 'emoji') $icon = $_POST['icon_emoji'];
-                elseif ($icon_type === 'url') $icon = $_POST['icon_url'];
-                elseif ($icon_type === 'upload') {
-                    if (isset($_FILES['icon_file']) && $_FILES['icon_file']['tmp_name']) {
-                        $fname = uniqid('icon_') . '.png';
-                        $target = ICONS_DIR . $fname;
-                        $img = imagecreatefromstring(file_get_contents($_FILES['icon_file']['tmp_name']));
-                        $dst = imagecreatetruecolor(46, 46);
-                        imagealphablending($dst, false); imagesavealpha($dst, true);
-                        imagecopyresampled($dst, $img, 0, 0, 0, 0, 46, 46, imagesx($img), imagesy($img));
-                        imagepng($dst, $target);
-                        imagedestroy($img); imagedestroy($dst);
-                        $icon = 'icons/' . $fname;
-                    } else {
-                        $icon = $_POST['icon_upload_existing'] ?? '';
-                    }
+            foreach ($config['groups'] as &$group) {
+                if ($action === 'add_service' && (string) $group['id'] === post('group_id')) {
+                    $service = serviceFromPost($users);
+                    $service['id'] = $config['next_service_id']++;
+                    $group['services'][] = $service;
+                    saveConfig($config);
+                    return ['success' => true];
                 }
-                $service = [
-                    'title' => $_POST['title'],
-                    'description' => $_POST['description'],
-                    'url' => $_POST['url'],
-                    'icon_type' => $icon_type,
-                    'icon' => $icon,
-                    'shared' => isset($_POST['shared']) && ($_POST['shared'] === 'true' || $_POST['shared'] === 'on'),
-                    'allowed_users' => isset($_POST['allowed_users']) ? (array)$_POST['allowed_users'] : [],
-                    'note' => $_POST['note'] ?? ''
-                ];
-                if ($_POST['action'] === 'add_service') {
-                    foreach ($config['groups'] as &$group) {
-                        if ($group['id'] == $_POST['group_id']) {
-                            $service['id'] = $config['next_service_id'];
-                            $group['services'][] = $service;
-                            $config['next_service_id']++;
-                            break;
+                if ($action === 'update_service') {
+                    foreach ($group['services'] as &$service) {
+                        if ((string) $service['id'] === $id) {
+                            $service = array_replace($service, serviceFromPost($users, $service));
+                            saveConfig($config);
+                            return ['success' => true];
                         }
                     }
-                } else { // update_service
-                    foreach ($config['groups'] as &$group) {
-                        foreach ($group['services'] as &$srv) {
-                            if ($srv['id'] == $_POST['id']) {
-                                if ($icon_type === 'upload' && empty($icon)) {
-                                    $service['icon'] = $srv['icon'];
-                                }
-                                $srv = array_merge($srv, $service);
-                                break 2;
-                            }
-                        }
-                    }
+                    unset($service);
                 }
-                saveConfig($config);
-                $response = ['success' => true];
             }
-            break;
+            throw new InvalidArgumentException('Group or service not found.');
         case 'delete_service':
-            if (isAdmin()) {
-                foreach ($config['groups'] as &$group) {
-                    $group['services'] = array_values(array_filter($group['services'], fn($s) => $s['id'] != $_POST['id']));
+        case 'get_note':
+        case 'set_note':
+            foreach ($config['groups'] as &$group) {
+                foreach ($group['services'] as $key => &$service) {
+                    if ((string) $service['id'] !== $id || !canView($service)) {
+                        continue;
+                    }
+                    if ($action === 'get_note') {
+                        return ['success' => true, 'note' => $service['note'] ?? ''];
+                    }
+                    if ($action === 'set_note') {
+                        $service['note'] = post('note');
+                    } else {
+                        unset($group['services'][$key]);
+                        $group['services'] = array_values($group['services']);
+                    }
+                    saveConfig($config);
+                    return ['success' => true];
                 }
-                saveConfig($config);
-                $response = ['success' => true];
+                unset($service);
             }
-            break;
+            jsonResponse(['success' => false, 'message' => 'Service not found.'], 404);
         case 'create_guest':
-            if (isAdmin()) {
-                $guestUsername = trim($_POST['username']);
-                $guestPassword = $_POST['password'];
-                if ($guestUsername === '' || $guestPassword === '') {
-                    $response = ['success' => false, 'message' => 'Username and password required'];
-                    break;
-                }
-                if (!isset($users[$guestUsername])) {
-                    $users[$guestUsername] = [
-                        'password' => password_hash($guestPassword, PASSWORD_DEFAULT),
-                        'role' => 'guest'
-                    ];
-                    saveUsers($users);
-                    $response = ['success' => true, 'username' => $guestUsername];
-                } else {
-                    $response = ['success' => false, 'message' => 'Username already exists'];
-                }
+            $password = post('password');
+            if (!preg_match('/^[A-Za-z0-9_.-]{1,64}$/D', $username) || !validPassword($password)) {
+                throw new InvalidArgumentException('Use letters, digits, dots, underscores or hyphens for the username and 12–72 bytes for the password.');
             }
+            if (isset($users[$username])) {
+                throw new InvalidArgumentException('Username already exists.');
+            }
+            $users[$username] = ['role' => 'guest', 'password' => password_hash($password, PASSWORD_DEFAULT)];
+            saveUsers($users);
             break;
         case 'delete_guest':
-            if (isAdmin()) {
-                $username = $_POST['username'];
-                if (isset($users[$username]) && $users[$username]['role'] === 'guest') {
-                    unset($users[$username]);
-                    saveUsers($users);
-                    $response = ['success' => true];
-                } else {
-                    $response = ['success' => false, 'message' => 'User not found'];
-                }
+            if (($users[$username]['role'] ?? null) !== 'guest') {
+                throw new InvalidArgumentException('Guest not found.');
             }
+            foreach ($config['groups'] as &$group) {
+                foreach ($group['services'] as &$service) {
+                    $service['allowed_users'] = array_values(array_filter(
+                        (array) ($service['allowed_users'] ?? []), fn($user) => $user !== $username
+                    ));
+                }
+                unset($service);
+            }
+            unset($group);
+            saveConfig($config);
+            unset($users[$username]);
+            saveUsers($users);
             break;
         case 'export_config':
-            if (isAdmin()) $response = ['success' => true, 'data' => $config];
-            break;
+            return ['success' => true, 'data' => $config];
         case 'import_config':
-            if (isAdmin()) {
-                $importData = json_decode($_POST['config_data'], true);
-                if ($importData) {
-                    saveConfig($importData);
-                    $response = ['success' => true];
-                } else {
-                    $response = ['success' => false, 'message' => 'Invalid JSON data'];
-                }
-            }
-            break;
-        case 'get_note':
-            $serviceId = $_POST['id'];
-            $note = '';
-            foreach ($config['groups'] as $group)
-                foreach ($group['services'] as $service)
-                    if ($service['id'] == $serviceId) { $note = $service['note'] ?? ''; break 2; }
-            $response = ['success' => true, 'note' => $note];
-            break;
-        case 'set_note':
-            if (isAdmin()) {
-                $serviceId = $_POST['id'];
-                $note = $_POST['note'] ?? '';
-                foreach ($config['groups'] as &$group)
-                    foreach ($group['services'] as &$service)
-                        if ($service['id'] == $serviceId) { $service['note'] = $note; break 2; }
-                saveConfig($config);
-                $response = ['success' => true];
-            }
+            saveConfig(importConfig(post('config_data')));
             break;
         case 'update_dashboard_title':
-            if (isAdmin()) {
-                $config['dashboard_title'] = $_POST['title'];
-                saveConfig($config);
-                $response = ['success' => true];
-            }
+            $config['dashboard_title'] = trim(post('title')) ?: 'Dashboard';
+            saveConfig($config);
             break;
         case 'change_password':
-            if (isAuthenticated()) {
-                $username = $_SESSION['user'];
-                $old = $_POST['old_password'] ?? '';
-                $new = $_POST['new_password'] ?? '';
-                $users = loadUsers();
-                if (!isset($users[$username]) || !password_verify($old, $users[$username]['password'])) {
-                    $response = ['success' => false, 'message' => 'Current password is incorrect'];
-                } elseif (strlen($new) < 4) {
-                    $response = ['success' => false, 'message' => 'New password too short'];
-                } else {
-                    $users[$username]['password'] = password_hash($new, PASSWORD_DEFAULT);
-                    saveUsers($users);
-                    $response = ['success' => true];
-                }
+            $username = $_SESSION['user'];
+            if (!password_verify(post('old_password'), $users[$username]['password'])) {
+                throw new InvalidArgumentException('Current password is incorrect.');
             }
+            if (!validPassword(post('new_password'))) {
+                throw new InvalidArgumentException('Use a password of 12–72 bytes.');
+            }
+            $hash = password_hash(post('new_password'), PASSWORD_DEFAULT);
+            $users[$username]['password'] = $hash;
+            saveUsers($users);
+            $_SESSION['credential'] = hash('sha256', $hash);
             break;
+        default:
+            throw new InvalidArgumentException('Unknown action.');
     }
-    header('Content-Type: application/json');
-    echo json_encode($response); exit;
+    return ['success' => true];
 }
 
-// --- INIT ---
-initializeConfig();
-$config = loadConfig();
+function serviceFromPost(array $users, array $previous = []): array
+{
+    $type = post('icon_type', 'fa');
+    $icon = $type === 'upload'
+        ? (($previous['icon_type'] ?? '') === 'upload' ? $previous['icon'] : '')
+        : post('icon_' . $type);
+    $allowed = array_filter((array) ($_POST['allowed_users'] ?? []),
+        fn($user) => is_string($user) && ($users[$user]['role'] ?? null) === 'guest');
+    $service = [
+        'title' => trim(post('title')), 'description' => post('description'), 'url' => trim(post('url')),
+        'icon_type' => $type, 'icon' => $icon, 'note' => post('note'),
+        'shared' => in_array(post('shared'), ['on', 'true'], true),
+        'allowed_users' => array_values(array_unique($allowed)),
+    ];
+    validateService($service);
+    $file = $_FILES['icon_file'] ?? null;
+    if ($type === 'upload' && $file && $file['error'] !== UPLOAD_ERR_NO_FILE) {
+        $service['icon'] = saveIcon($file);
+    }
+    return $service;
+}
 
-// --- Гостевой режим: фильтрация сервисов без дублей и без ошибок! ---
-if (isset($_SESSION['role']) && $_SESSION['role'] === 'guest') {
-    $currentUser = $_SESSION['user'];
-    $filtered_groups = [];
-    $shown_service_ids = []; // Глобальный массив для всех групп
+try {
+    umask(0077);
+    define('DATA_DIR', dataDirectory());
+    define('CONFIG_FILE', DATA_DIR . '/dashboard_config.json');
+    define('USERS_FILE', DATA_DIR . '/users.json');
+    $lock = fopen(DATA_DIR . '/.lock', 'c');
+    if (!$lock || !flock($lock, LOCK_EX)) {
+        throw new RuntimeException('Could not lock dashboard data.');
+    }
+    $users = readJson(USERS_FILE, []);
+    if (PHP_SAPI === 'cli') {
+        if (($argv[1] ?? '') !== 'set-admin-password') {
+            throw new InvalidArgumentException('Usage: php index.php set-admin-password (read the password from stdin).');
+        }
+        $password = rtrim(fgets(STDIN, 76) ?: '', "\r\n");
+        if (!validPassword($password)) {
+            throw new InvalidArgumentException('Use a password of 12–72 bytes.');
+        }
+        saveUsers(array_replace($users, ['admin' => [
+            'role' => 'admin', 'password' => password_hash($password, PASSWORD_DEFAULT),
+        ]]));
+        fwrite(STDOUT, "Administrator password saved.\n");
+        exit;
+    }
 
-    foreach ($config['groups'] as $group) {
-        $unique_services = [];
-        foreach ($group['services'] as $service) {
-            $show = (isset($service['shared']) && $service['shared']) ||
-                    (isset($service['allowed_users']) && in_array($currentUser, (array)$service['allowed_users']));
-            // Показываем только если сервис ещё не был показан ни в одной группе
-            if ($show && !in_array($service['id'], $shown_service_ids)) {
-                $unique_services[] = $service;
-                $shown_service_ids[] = $service['id'];
+    $config = readJson(CONFIG_FILE, defaultConfig());
+    session_name('EasyDashboard');
+    if (!@session_start([
+        'use_strict_mode' => true,
+        'use_only_cookies' => true,
+        'cookie_httponly' => true,
+        'cookie_samesite' => 'Lax',
+        'cookie_secure' => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
+    ])) {
+        throw new RuntimeException('Could not start the PHP session. Check session.save_path.');
+    }
+    header('Cache-Control: no-store');
+    header('X-Content-Type-Options: nosniff');
+    $_SESSION['csrf'] ??= bin2hex(random_bytes(32));
+    $account = $users[$_SESSION['user'] ?? ''] ?? [];
+    if (isAuthenticated() && (
+        ($account['role'] ?? null) !== $_SESSION['role']
+        || hash('sha256', $account['password'] ?? '') !== ($_SESSION['credential'] ?? '')
+    )) {
+        unset($_SESSION['user'], $_SESSION['role'], $_SESSION['credential']);
+    }
+
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        if (!hash_equals($_SESSION['csrf'], post('csrf'))) {
+            jsonResponse(['success' => false, 'message' => 'Session expired. Reload the page and try again.'], 403);
+        }
+        if (isset($_POST['action'])) {
+            jsonResponse(handleAction(post('action'), $config, $users));
+        }
+        if (isset($_POST['logout'])) {
+            $_SESSION = [];
+            session_destroy();
+            redirectHome();
+        }
+        if (isset($_POST['login'])) {
+            $username = trim(post('username'));
+            $password = post('password');
+            $account = $users[$username] ?? [];
+            if (isset($account['password']) && password_verify($password, $account['password'])
+                && !($account['role'] === 'admin' && $password === 'admin123')) {
+                if (!session_regenerate_id(true)) {
+                    throw new RuntimeException('Could not renew the PHP session.');
+                }
+                $_SESSION = [
+                    'user' => $username, 'role' => $account['role'],
+                    'credential' => hash('sha256', $account['password']), 'csrf' => bin2hex(random_bytes(32)),
+                ];
+                redirectHome();
             }
-        }
-        // Гости не видят allowed_users других сервисов
-        foreach ($unique_services as &$service) {
-            unset($service['allowed_users']);
-        }
-        unset($service);
-        if (!empty($unique_services)) {
-            $group['services'] = $unique_services;
-            $filtered_groups[] = $group;
+            $loginError = 'Invalid credentials';
         }
     }
-    $config['groups'] = $filtered_groups;
+    foreach ($config['groups'] as &$group) {
+        $group['services'] = array_values(array_filter($group['services'], 'canView'));
+    }
+    unset($group);
+    if (!isAdmin()) {
+        $config['groups'] = array_filter($config['groups'], fn($group) => $group['services'] !== []);
+    }
+    if (isset($_GET['icon'])) {
+        $icon = is_string($_GET['icon']) ? 'icons/' . $_GET['icon'] : '';
+        if (uploadedIcon($icon) && is_readable(DATA_DIR . '/' . $icon)) {
+            foreach ($config['groups'] as $group) {
+                foreach ($group['services'] as $service) {
+                    if ($service['icon_type'] === 'upload' && $service['icon'] === $icon) {
+                        header('Content-Type: image/png');
+                        readfile(DATA_DIR . '/' . $icon);
+                        exit;
+                    }
+                }
+            }
+        }
+        http_response_code(404);
+        exit;
+    }
+    fclose($lock);
+} catch (Throwable $error) {
+    if (PHP_SAPI === 'cli') {
+        fwrite(STDERR, $error->getMessage() . "\n");
+        exit(1);
+    }
+    if (isset($_POST['action']) && ($error instanceof InvalidArgumentException || $error instanceof JsonException)) {
+        jsonResponse(['success' => false, 'message' => $error instanceof JsonException ? 'Invalid JSON data.' : $error->getMessage()], 422);
+    }
+    error_log('Easy Dashboard: ' . $error->getMessage());
+    if (isset($_POST['action'])) {
+        jsonResponse(['success' => false, 'message' => 'Dashboard data is unavailable. Check the server logs.'], 500);
+    }
+    http_response_code(503);
+    exit('Dashboard data is unavailable. Check the server logs.');
 }
 
 // --- PALETTE ---
@@ -403,7 +385,7 @@ $palette = [
         .group-actions .dropdown-menu button { width:100%;background:none;border:none;color:#333;text-align:left;padding:0.7rem 1.2rem;font-size:1rem;cursor:pointer;}
         .group-actions .dropdown-menu button:hover { background:#f1f3f6;}
         .services-grid { display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:1rem;}
-        .service-card { background:#f8f9fa;border-radius:8px;padding:1rem;border:2px solid transparent;transition:all 0.3s;cursor:pointer;position:relative;min-height:120px;display:flex;flex-direction:column;justify-content:flex-start;}
+        .service-card { background:#f8f9fa;border-radius:8px;padding:1rem;border:2px solid transparent;transition:all 0.3s;position:relative;min-height:120px;display:flex;flex-direction:column;justify-content:flex-start;}
         .service-card:hover { border-color:#007aff;transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,0.1);}
         .service-icon-wrap { width:64px;height:64px;border-radius:16px;background:#f3f3f3;display:flex;align-items:center;justify-content:center;box-shadow:0 2px 8px rgba(0,0,0,0.06);margin-bottom:0.5rem;}
         .service-icon-img { width:46px;height:46px;object-fit:contain;border-radius:8px;}
@@ -412,7 +394,8 @@ $palette = [
         .service-title { font-weight:600;color:#333;margin-bottom:0.25rem;}
         .service-description { color:#666;font-size:0.9rem;margin-bottom:0.5rem;}
         .service-actions { position:absolute;top:0.5rem;right:0.5rem;display:flex;gap:0.25rem;opacity:0;transition:opacity 0.3s;}
-        .service-card:hover .service-actions { opacity:1;}
+        .service-card:hover .service-actions, .service-card:focus-within .service-actions { opacity:1;}
+        @media (hover: none) { .service-actions { opacity:1; } }
         .service-actions button { padding:0.25rem 0.5rem;font-size:0.8rem;}
         .shared-badge { display:inline-block;background:#28a745;color:white;padding:0.25rem 0.5rem;border-radius:4px;font-size:0.7rem;font-weight:500;margin-right:0.5rem;margin-bottom:0.25rem;}
         .allowed-badge { display:inline-block;background:#007aff;color:white;padding:0.2rem 0.5rem;border-radius:4px;font-size:0.7rem;font-weight:500;margin-right:0.25rem;margin-bottom:0.25rem;}
@@ -572,7 +555,8 @@ $palette = [
 <body>
 <?php if (!isAuthenticated()): ?>
     <div class="login-container">
-        <form class="login-form" method="POST" autocomplete="off">
+        <form class="login-form" method="POST">
+            <input type="hidden" name="csrf" value="<?= $_SESSION['csrf'] ?>">
             <h2>Login to Dashboard</h2>
             <?php if (isset($loginError)): ?>
                 <div class="error"><?= htmlspecialchars($loginError) ?></div>
@@ -607,10 +591,13 @@ $palette = [
             <h4>Guest Users</h4>
             <ul id="guestList" style="margin-bottom:1rem;">
                 <?php
-                $users = loadUsers();
                 foreach ($users as $uname => $udata) {
                     if ($udata['role'] === 'guest') {
-                        echo '<li><span class="guest-name">' . htmlspecialchars($uname) . '</span><button class="guest-delete-btn" onclick="deleteGuest(\'' . addslashes($uname) . '\')">Delete</button></li>';
+                        ?>
+                        <li><span class="guest-name"><?= htmlspecialchars($uname) ?></span>
+                            <button class="guest-delete-btn" onclick="<?= callJs('deleteGuest', (string) $uname) ?>">Delete</button>
+                        </li>
+                        <?php
                     }
                 }
                 ?>
@@ -623,7 +610,7 @@ $palette = [
     <div class="header">
         <h1>
             <?php if (isAdmin()): ?>
-                <input id="dashboardTitleInput" value="<?= htmlspecialchars($config['dashboard_title'] ?? 'Dashboard') ?>" />
+                <input aria-label="Dashboard title" id="dashboardTitleInput" value="<?= htmlspecialchars($config['dashboard_title'] ?? 'Dashboard') ?>" />
                 <i class="fa fa-pen" style="font-size:1.1rem;opacity:0.5;margin-left:0.2rem;"></i>
             <?php else: ?>
                 <?= htmlspecialchars($config['dashboard_title'] ?? 'Dashboard') ?>
@@ -634,12 +621,15 @@ $palette = [
                 Welcome, <?= htmlspecialchars($_SESSION['user']) ?> (<?= htmlspecialchars($_SESSION['role']) ?> |
                 <a href="#" onclick="showModal('passwordModal');return false;" style="color:#007aff;">update password</a>)
             </span>
-            <a href="?logout=1" style="color:#007aff;text-decoration:none;">Logout</a>
+            <form method="POST">
+                <input type="hidden" name="csrf" value="<?= $_SESSION['csrf'] ?>">
+                <button type="submit" name="logout" class="btn-secondary">Log out</button>
+            </form>
         </div>
     </div>
     <div class="main-content">
         <?php foreach ($config['groups'] as $group): ?>
-            <div class="group" style="--group-bg:<?= htmlspecialchars($group['color'] ?? '#f5f5f7') ?>">
+            <div class="group" style="--group-bg:<?= groupColor($group['color'] ?? '') ?>">
                 <div class="group-header">
                     <h2 class="group-title"><?= htmlspecialchars($group['name']) ?></h2>
                     <?php if (isAdmin()): ?>
@@ -648,16 +638,16 @@ $palette = [
                                 <i class="fa fa-ellipsis-v"></i>
                             </button>
                             <div class="dropdown-menu">
-                                <button onclick="addService(<?= $group['id'] ?>);event.stopPropagation();">Add Service</button>
-                                <button onclick="editGroup(<?= $group['id'] ?>,'<?= htmlspecialchars($group['name']) ?>','<?= htmlspecialchars($group['color'] ?? '#f5f5f7') ?>');event.stopPropagation();">Edit Group</button>
-                                <button class="btn-danger" onclick="deleteGroup(<?= $group['id'] ?>);event.stopPropagation();">Delete Group</button>
+                                <button onclick="addService(<?= (int) $group['id'] ?>);event.stopPropagation();">Add Service</button>
+                                <button onclick="<?= callJs('editGroup', (int) $group['id'], $group['name'], groupColor($group['color'] ?? '')) ?>;event.stopPropagation();">Edit Group</button>
+                                <button class="btn-danger" onclick="deleteGroup(<?= (int) $group['id'] ?>);event.stopPropagation();">Delete Group</button>
                             </div>
                         </div>
                     <?php endif; ?>
                 </div>
                 <div class="services-grid">
                     <?php foreach ($group['services'] as $service): ?>
-                        <div class="service-card" onclick="openService('<?= htmlspecialchars($service['url']) ?>')">
+                        <div class="service-card">
                             <span class="service-icon-wrap">
                                 <?php
                                 if (!empty($service['icon'])) {
@@ -665,15 +655,21 @@ $palette = [
                                         echo '<span class="service-icon"><i class="' . htmlspecialchars($service['icon']) . '"></i></span>';
                                     } elseif ($service['icon_type'] === 'emoji') {
                                         echo '<span class="service-icon">' . htmlspecialchars($service['icon']) . '</span>';
-                                    } elseif ($service['icon_type'] === 'url') {
-                                        echo '<img src="' . htmlspecialchars($service['icon']) . '" class="service-icon-img" alt="icon">';
+                                    } elseif ($iconUrl = serviceIconUrl($service)) {
+                                        echo '<img src="' . htmlspecialchars($iconUrl) . '" class="service-icon-img" alt="" referrerpolicy="no-referrer">';
                                     } elseif ($service['icon_type'] === 'upload') {
                                         echo '<img src="' . htmlspecialchars($service['icon']) . '" class="service-icon-img" alt="icon">';
                                     }
                                 }
                                 ?>
                             </span>
-                            <div class="service-title"><?= htmlspecialchars($service['title']) ?></div>
+                            <div class="service-title">
+                                <?php if (httpUrl($service['url'])): ?>
+                                    <a href="<?= htmlspecialchars($service['url']) ?>" target="_blank" rel="noopener noreferrer"><?= htmlspecialchars($service['title']) ?></a>
+                                <?php else: ?>
+                                    <?= htmlspecialchars($service['title']) ?>
+                                <?php endif; ?>
+                            </div>
                             <div class="service-description"><?= htmlspecialchars($service['description']) ?></div>
                             <div class="badges-row">
                                 <?php if (isset($service['shared']) && $service['shared']): ?>
@@ -685,13 +681,13 @@ $palette = [
                                     <?php endforeach; ?>
                                 <?php endif; ?>
                             </div>
-                            <?php if (isAdmin()): ?>
-                                <div class="service-actions" onclick="event.stopPropagation();">
-                                    <button class="note-btn" title="Show note" onclick="showNoteModal(<?= $service['id'] ?>)">📝</button>
-                                    <button class="btn-secondary" onclick="editService(<?= $service['id'] ?>,<?= htmlspecialchars(json_encode($service),ENT_QUOTES,'UTF-8') ?>)">Edit</button>
-                                    <button class="btn-danger" onclick="deleteService(<?= $service['id'] ?>)">Delete</button>
-                                </div>
-                            <?php endif; ?>
+                            <div class="service-actions">
+                                <button class="note-btn" aria-label="Show note" title="Show note" onclick="showNoteModal(<?= (int) $service['id'] ?>)">📝</button>
+                                <?php if (isAdmin()): ?>
+                                    <button class="btn-secondary" onclick="<?= callJs('editService', (int) $service['id'], $service, serviceIconUrl($service)) ?>">Edit</button>
+                                    <button class="btn-danger" onclick="deleteService(<?= (int) $service['id'] ?>)">Delete</button>
+                                <?php endif; ?>
+                            </div>
                         </div>
                     <?php endforeach; ?>
                 </div>
@@ -699,6 +695,7 @@ $palette = [
         <?php endforeach; ?>
     </div>
     <!-- Modals -->
+    <?php if (isAdmin()): ?>
     <div id="groupModal" class="modal">
         <div class="modal-content">
             <span class="close" onclick="hideModal('groupModal')">&times;</span>
@@ -763,22 +760,21 @@ $palette = [
                 </div>
                 <div class="form-group icon-input icon-upload" style="display:none;">
                     <label for="icon_file">Upload Image (PNG/JPG, 46x46 recommended):</label>
-                    <input type="file" id="icon_file" name="icon_file" accept="image/*">
-                    <input type="hidden" id="icon_upload_existing" name="icon_upload_existing">
+                    <input type="file" id="icon_file" name="icon_file" accept="image/png,image/jpeg">
                     <div id="icon_upload_preview" style="margin-top:0.5rem;"></div>
                 </div>
                 <div class="checkbox-group">
                     <input type="checkbox" id="serviceShared" name="shared">
-                    <label for="serviceShared">Share with guests</label>
+                    <label for="serviceShared">Share with all signed-in guests</label>
                 </div>
                 <div class="form-group">
                     <label for="serviceAllowedUsers">Allowed Users:</label>
                     <select id="serviceAllowedUsers" name="allowed_users[]" multiple>
-                        <?php foreach (loadUsers() as $uname => $udata): ?>
+                        <?php foreach ($users as $uname => $udata): if ($udata['role'] !== 'guest') continue; ?>
                             <option value="<?= htmlspecialchars($uname) ?>"><?= htmlspecialchars($uname) ?></option>
                         <?php endforeach; ?>
                     </select>
-                    <small>Select users who can access this service (leave empty for all)</small>
+                    <small>Select individual guests when sharing with all guests is off.</small>
                 </div>
                 <div class="form-group">
                     <label for="serviceNote">Note:</label>
@@ -819,6 +815,7 @@ $palette = [
             </form>
         </div>
     </div>
+    <?php endif; ?>
     <div id="noteModal" class="modal">
         <div class="modal-content">
             <span class="close" onclick="hideModal('noteModal')">&times;</span>
@@ -854,8 +851,10 @@ $palette = [
         Developed by Uladzislau Murashka &middot; <a href="https://github.com/sm0k3net" target="_blank">github.com/sm0k3net</a>
     </footer>
     <script>
+        const csrf = <?= json_encode($_SESSION['csrf']) ?>;
+        const admin = <?= json_encode(isAdmin()) ?>;
         // Sidebar logic
-        let sidebarPinned = localStorage.getItem('sidebarPinned') === 'true';
+        let sidebarPinned = admin && localStorage.getItem('sidebarPinned') === 'true';
         function toggleSidebar() {
             document.getElementById('adminSidebar').classList.toggle('open');
         }
@@ -889,7 +888,6 @@ $palette = [
             if (modalId === 'serviceModal') {
                 document.getElementById('serviceAllowedUsers').selectedIndex = -1;
                 document.getElementById('icon_upload_preview').innerHTML = '';
-                document.getElementById('icon_upload_existing').value = '';
             }
             if (modalId === 'noteModal') {
                 document.getElementById('noteText').value = '';
@@ -904,7 +902,6 @@ $palette = [
                 document.getElementById('passwordSuccess').style.display = 'none';
             }
         }
-        function openService(url) { window.open(url, '_blank'); }
         function addService(groupId) {
             document.getElementById('serviceModalTitle').textContent = 'Add Service';
             document.getElementById('serviceId').value = '';
@@ -916,7 +913,6 @@ $palette = [
             document.getElementById('icon_emoji').value = '';
             document.getElementById('icon_url').value = '';
             document.getElementById('icon_file').value = '';
-            document.getElementById('icon_upload_existing').value = '';
             document.getElementById('icon_upload_preview').innerHTML = '';
             document.querySelector('input[name="icon_type"][value="fa"]').checked = true;
             showIconInput('fa');
@@ -925,7 +921,7 @@ $palette = [
             document.getElementById('serviceNote').value = '';
             showModal('serviceModal');
         }
-        function editService(serviceId, serviceData) {
+        function editService(serviceId, serviceData, iconUrl) {
             document.getElementById('serviceModalTitle').textContent = 'Edit Service';
             document.getElementById('serviceId').value = serviceId;
             document.getElementById('serviceGroupId').value = '';
@@ -940,14 +936,7 @@ $palette = [
             if (t === 'fa') document.getElementById('icon_fa').value = serviceData.icon;
             if (t === 'emoji') document.getElementById('icon_emoji').value = serviceData.icon;
             if (t === 'url') document.getElementById('icon_url').value = serviceData.icon;
-            if (t === 'upload') {
-                document.getElementById('icon_upload_existing').value = serviceData.icon;
-                if (serviceData.icon) {
-                    document.getElementById('icon_upload_preview').innerHTML = '<img src="'+serviceData.icon+'" style="width:46px;height:46px;border-radius:8px;">';
-                } else {
-                    document.getElementById('icon_upload_preview').innerHTML = '';
-                }
-            }
+            if (t === 'upload') showIconPreview(iconUrl);
             const select = document.getElementById('serviceAllowedUsers');
             Array.from(select.options).forEach(opt => {
                 opt.selected = (serviceData.allowed_users || []).includes(opt.value);
@@ -973,49 +962,51 @@ $palette = [
         }
         function deleteGuest(username) {
             if (confirm('Delete guest user ' + username + '?')) {
-                makeRequest('delete_guest', {username: username}, function(resp) {
-                    if (resp.success) {
-                        const guestList = document.getElementById('guestList');
-                        const items = guestList.querySelectorAll('li');
-                        items.forEach(li => {
-                            if (li.querySelector('.guest-name').textContent === username) li.remove();
-                        });
-                    } else {
-                        alert(resp.message || 'Failed to delete guest');
-                    }
-                });
+                makeRequest('delete_guest', {username});
             }
         }
         function exportConfig() {
             makeRequest('export_config', {}, function(response) {
-                if (response.success) {
-                    const dataStr = JSON.stringify(response.data, null, 2);
-                    const dataBlob = new Blob([dataStr], {type: 'application/json'});
-                    const url = URL.createObjectURL(dataBlob);
-                    const link = document.createElement('a');
-                    link.href = url;
-                    link.download = 'dashboard_config.json';
-                    link.click();
-                    URL.revokeObjectURL(url);
+                if (!response.success) {
+                    alert(response.message || 'Could not export the configuration');
+                    return;
                 }
+                const dataStr = JSON.stringify(response.data, null, 2);
+                const dataBlob = new Blob([dataStr], {type: 'application/json'});
+                const url = URL.createObjectURL(dataBlob);
+                const link = document.createElement('a');
+                link.href = url;
+                link.download = 'dashboard_config.json';
+                link.click();
+                URL.revokeObjectURL(url);
             });
         }
         function makeRequest(action, data, callback) {
-            const formData = new FormData();
-            formData.append('action', action);
-            for (const key in data) {
+            const formData = data instanceof FormData ? data : new FormData();
+            formData.set('action', action);
+            formData.set('csrf', csrf);
+            for (const key of data instanceof FormData ? [] : Object.keys(data)) {
                 if (Array.isArray(data[key])) data[key].forEach(v => formData.append(key+'[]', v));
                 else formData.append(key, data[key]);
             }
             fetch(window.location.href, { method:'POST', body:formData })
-            .then(response => response.json())
+            .then(async response => {
+                const result = await response.json();
+                if (response.status === 401) {
+                    window.location.reload();
+                    return;
+                }
+                return result;
+            })
             .then(data => {
+                if (!data) return;
                 if (callback) callback(data);
                 else if (data.success) location.reload();
                 else alert(data.message || 'Operation failed');
             })
             .catch(error => { console.error('Error:', error); alert('An error occurred'); });
         }
+        <?php if (isAdmin()): ?>
         document.getElementById('groupForm').addEventListener('submit', function(e) {
             e.preventDefault();
             const formData = new FormData(this);
@@ -1030,11 +1021,8 @@ $palette = [
             e.preventDefault();
             const form = this;
             const formData = new FormData(form);
-            let action = formData.get('id') ? 'update_service' : 'add_service';
-            formData.append('action', action);
-            fetch(window.location.href, { method:'POST', body:formData })
-            .then(response => response.json())
-            .then(data => { if (data.success) location.reload(); else alert(data.message || 'Operation failed'); });
+            const action = formData.get('id') ? 'update_service' : 'add_service';
+            makeRequest(action, formData);
         });
         document.getElementById('guestForm').addEventListener('submit', function(e) {
             e.preventDefault();
@@ -1044,11 +1032,7 @@ $palette = [
             errorDiv.style.display = 'none';
             makeRequest('create_guest', {username, password}, function(resp) {
                 if (resp.success) {
-                    const guestList = document.getElementById('guestList');
-                    const li = document.createElement('li');
-                    li.innerHTML = '<span class="guest-name">'+username+'</span><button class="guest-delete-btn" onclick="deleteGuest(\''+username+'\')">Delete</button>';
-                    guestList.appendChild(li);
-                    hideModal('guestModal');
+                    location.reload();
                 } else {
                     errorDiv.textContent = resp.message || 'Failed to create guest';
                     errorDiv.style.display = '';
@@ -1067,34 +1051,44 @@ $palette = [
         document.querySelectorAll('input[name="icon_type"]').forEach(radio => {
             radio.addEventListener('change', function() { showIconInput(this.value); });
         });
-        document.getElementById('icon_file').addEventListener('change', function() {
+        function showIconPreview(url) {
             const preview = document.getElementById('icon_upload_preview');
-            preview.innerHTML = '';
-            if (this.files && this.files[0]) {
+            preview.replaceChildren();
+            if (url) {
+                const image = document.createElement('img');
+                image.src = url;
+                image.className = 'service-icon-img';
+                image.alt = 'Icon preview';
+                preview.append(image);
+            }
+        }
+        document.getElementById('icon_file').addEventListener('change', function() {
+            showIconPreview('');
+            if (this.files[0]) {
                 const reader = new FileReader();
-                reader.onload = function(e) {
-                    preview.innerHTML = '<img src="'+e.target.result+'" style="width:46px;height:46px;border-radius:8px;">';
-                };
+                reader.onload = () => showIconPreview(reader.result);
                 reader.readAsDataURL(this.files[0]);
             }
         });
+        <?php endif; ?>
         function showNoteModal(serviceId) {
-            event.stopPropagation();
-            showModal('noteModal');
             document.getElementById('noteServiceId').value = serviceId;
-            document.getElementById('noteText').style.display = '';
-            document.getElementById('noteForm').style.display = '';
-            document.getElementById('noteView').style.display = 'none';
-            fetch(window.location.href, {
-                method: 'POST',
-                body: new URLSearchParams({action: 'get_note', id: serviceId})
-            })
-            .then(r => r.json())
-            .then(data => {
+            makeRequest('get_note', {id: serviceId}, data => {
+                if (document.getElementById('noteServiceId').value !== String(serviceId)) return;
+                if (!data.success) {
+                    alert(data.message || 'Could not load the note');
+                    return;
+                }
                 document.getElementById('noteText').value = data.note || '';
-                document.getElementById('noteView').textContent = data.note || '';
+                document.getElementById('noteForm').style.display = admin ? '' : 'none';
+                const view = document.getElementById('noteView');
+                view.textContent = data.note || 'No note has been added.';
+                view.style.display = admin ? 'none' : '';
+                document.getElementById('noteText').style.display = '';
+                showModal('noteModal');
             });
         }
+        <?php if (isAdmin()): ?>
         document.getElementById('noteForm').addEventListener('submit', function(e) {
             e.preventDefault();
             const serviceId = document.getElementById('noteServiceId').value;
@@ -1105,12 +1099,13 @@ $palette = [
                     document.getElementById('noteView').style.display = '';
                     document.getElementById('noteText').style.display = 'none';
                     document.getElementById('noteForm').style.display = 'none';
+                } else {
+                    alert(resp.message || 'Could not save the note');
                 }
             });
         });
-        <?php if (isAdmin()): ?>
         document.getElementById('dashboardTitleInput').addEventListener('change', function() {
-            makeRequest('update_dashboard_title', {title: this.value}, function() { location.reload(); });
+            makeRequest('update_dashboard_title', {title: this.value});
         });
         <?php endif; ?>
         document.getElementById('passwordForm').addEventListener('submit', function(e) {

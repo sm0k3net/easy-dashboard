@@ -1,0 +1,6 @@
+/data/
+/icons/
+/dashboard_config.json
+/users.json
+/.lock
+/.dashboard-*
